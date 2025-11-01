@@ -44,7 +44,7 @@ const DEFAULT_SETTINGS = {
         enableGroupMemory: true,
         preferCharacterOverChat: true,
         preferGroupOverChat: true,
-        preferIndividualCharacterInGroup: false,
+        preferIndividualCharacterInGroup: true,  // FIXED: Changed from false to true
         showNotifications: true,
         autoApplyOnContextChange: AUTO_APPLY_MODES.ASK  // Default to ask
     },
@@ -758,24 +758,47 @@ class SettingsPriorityResolver {
         }
     }
 
+    // FIXED: Updated to add debug logging
     _resolveGroupSettings(context, settings) {
         const prefs = this.extensionSettings.moduleSettings;
         const { group, chat, individual } = settings;
 
+        // Individual character settings take precedence if enabled and available
         if (prefs.preferIndividualCharacterInGroup && individual) {
+            if (DEBUG_MODE) console.log('STCL: Using individual character settings (highest priority)');
             return { settings: individual, source: SETTING_SOURCES.INDIVIDUAL };
         }
 
+        // Then check group vs chat preference
         if (prefs.preferGroupOverChat) {
-            if (group) return { settings: group, source: SETTING_SOURCES.GROUP };
-            if (chat) return { settings: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
-            if (individual) return { settings: individual, source: `${SETTING_SOURCES.INDIVIDUAL} (fallback)` };
+            if (group) {
+                if (DEBUG_MODE) console.log('STCL: Using group settings');
+                return { settings: group, source: SETTING_SOURCES.GROUP };
+            }
+            if (chat) {
+                if (DEBUG_MODE) console.log('STCL: Using group chat settings (fallback)');
+                return { settings: chat, source: `${SETTING_SOURCES.GROUP_CHAT} (fallback)` };
+            }
+            if (individual) {
+                if (DEBUG_MODE) console.log('STCL: Using individual character settings (fallback)');
+                return { settings: individual, source: `${SETTING_SOURCES.INDIVIDUAL} (fallback)` };
+            }
         } else {
-            if (chat) return { settings: chat, source: SETTING_SOURCES.GROUP_CHAT };
-            if (group) return { settings: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
-            if (individual) return { settings: individual, source: `${SETTING_SOURCES.INDIVIDUAL} (fallback)` };
+            if (chat) {
+                if (DEBUG_MODE) console.log('STCL: Using group chat settings');
+                return { settings: chat, source: SETTING_SOURCES.GROUP_CHAT };
+            }
+            if (group) {
+                if (DEBUG_MODE) console.log('STCL: Using group settings (fallback)');
+                return { settings: group, source: `${SETTING_SOURCES.GROUP} (fallback)` };
+            }
+            if (individual) {
+                if (DEBUG_MODE) console.log('STCL: Using individual character settings (fallback)');
+                return { settings: individual, source: `${SETTING_SOURCES.INDIVIDUAL} (fallback)` };
+            }
         }
 
+        if (DEBUG_MODE) console.log('STCL: No settings available');
         return { settings: null, source: 'none' };
     }
 
@@ -2162,36 +2185,41 @@ function setupEventListeners() {
                 onContextChanged();
             }, 'group chat creation');
 
+            // FIXED: Completely rewritten GROUP_MEMBER_DRAFTED handler
             registerEventHandler(event_types.GROUP_MEMBER_DRAFTED, async (chId) => {
                 try {
-                    // Check if individual character preference is enabled
-                    const extensionSettings = storageAdapter.getExtensionSettings();
-                    const prefs = extensionSettings.moduleSettings;
-                    if (!prefs.preferIndividualCharacterInGroup) {
+                    // Prevent concurrent processing
+                    if (processingCharacter) {
+                        if (DEBUG_MODE) console.log('STCL: Already processing character, queuing');
                         return;
                     }
+                    
+                    processingCharacter = true;
 
-                    // Use window.characters for broader compatibility
+                    // Validate chId
                     const chars = (typeof characters !== 'undefined') ? characters : window.characters;
 
                     if (!chars || !Array.isArray(chars)) {
                         console.error('STCL: Characters array not available or invalid');
+                        processingCharacter = false;
                         return;
                     }
 
                     if (typeof chId !== 'number' || chId < 0 || chId >= chars.length) {
                         console.error('STCL: Invalid character ID:', chId, 'characters length:', chars.length);
+                        processingCharacter = false;
                         return;
                     }
 
                     const charObj = chars[chId];
                     if (!charObj || !charObj.name) {
                         console.error('STCL: Character object is null, undefined, or missing name at index:', chId);
+                        processingCharacter = false;
                         return;
                     }
 
                     if (DEBUG_MODE) {
-                        console.log('STCL: group_member_drafted - applying individual character settings:', {
+                        console.log('STCL: GROUP_MEMBER_DRAFTED event fired:', {
                             chId,
                             draftedCharacter: charObj,
                             name: charObj.name,
@@ -2199,35 +2227,72 @@ function setupEventListeners() {
                         });
                     }
 
-                    // Apply character-specific connection profile and preset before generation
-                    // Use chId for storage lookup
+                    // Get current context
                     const context = settingsManager.chatContext.getCurrent();
+                    
+                    if (context?.type !== CHAT_TYPES.GROUP) {
+                        if (DEBUG_MODE) console.log('STCL: Not in a group chat, ignoring GROUP_MEMBER_DRAFTED');
+                        processingCharacter = false;
+                        return;
+                    }
 
-                    if (context?.type === CHAT_TYPES.GROUP) {
-                        // Get individual character settings using chId as key
-                        const individual = storageAdapter.getCharacterSettings(chId);
-                        if (individual) {
-                            if (DEBUG_MODE) console.log(`STCL: Found individual character settings for ${charObj.name} in group chat`);
+                    // Get individual character settings using chId as key
+                    const individual = storageAdapter.getCharacterSettings(chId);
+                    
+                    if (!individual) {
+                        if (DEBUG_MODE) console.log(`STCL: No individual character settings found for ${charObj.name} (chId: ${chId})`);
+                        processingCharacter = false;
+                        return;
+                    }
 
-                            // Respect the auto-apply mode setting
-                            const autoApplyMode = prefs.autoApplyOnContextChange;
-                            if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-                                if (DEBUG_MODE) console.log('STCL: Auto-apply disabled, skipping character settings application');
-                                return;
-                            } else if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-                                const shouldApply = await settingsManager._askUserToApplySettings(context);
-                                if (!shouldApply) {
-                                    if (DEBUG_MODE) console.log('STCL: User declined to apply character settings');
-                                    return;
-                                }
-                            }
+                    if (DEBUG_MODE) console.log(`STCL: Found individual character settings for ${charObj.name} in group chat`);
 
-                            if (DEBUG_MODE) console.log(`STCL: Applying individual character settings for ${charObj.name} in group chat`);
-                            await settingsManager._applySettingsToUI(individual);
+                    // Temporarily set the individual settings for priority resolution
+                    settingsManager.currentSettings.individual = individual;
+
+                    // Use the priority resolver to determine if individual settings should be applied
+                    const resolved = await settingsManager.getSettingsToApply();
+                    
+                    // Clear the temporary individual setting
+                    settingsManager.currentSettings.individual = null;
+
+                    if (resolved.settings !== individual) {
+                        if (DEBUG_MODE) console.log(`STCL: Individual character settings for ${charObj.name} not prioritized, skipping`);
+                        processingCharacter = false;
+                        return;
+                    }
+
+                    // Check auto-apply mode
+                    const extensionSettings = storageAdapter.getExtensionSettings();
+                    const prefs = extensionSettings.moduleSettings;
+                    const autoApplyMode = prefs.autoApplyOnContextChange;
+
+                    if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
+                        if (DEBUG_MODE) console.log('STCL: Auto-apply disabled, skipping character settings application');
+                        processingCharacter = false;
+                        return;
+                    } else if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+                        const message = `Apply saved individual character settings for "${charObj.name}" in this group chat?`;
+                        const result = await callGenericPopup(message, POPUP_TYPE.CONFIRM, '', { 
+                            okButton: 'Apply', 
+                            cancelButton: 'Skip' 
+                        });
+                        
+                        if (result !== POPUP_RESULT.AFFIRMATIVE) {
+                            if (DEBUG_MODE) console.log('STCL: User declined to apply character settings');
+                            processingCharacter = false;
+                            return;
                         }
                     }
+
+                    // Apply the individual character settings
+                    if (DEBUG_MODE) console.log(`STCL: Applying individual character settings for ${charObj.name} in group chat`);
+                    await settingsManager._applySettingsToUI(individual);
+
                 } catch (error) {
                     console.error('STCL: Error in GROUP_MEMBER_DRAFTED handler:', error);
+                } finally {
+                    processingCharacter = false;
                 }
             });
 
@@ -2327,8 +2392,9 @@ function migrateOldData() {
     if (!extensionSettings.moduleSettings.hasOwnProperty('preferGroupOverChat')) {
         extensionSettings.moduleSettings.preferGroupOverChat = true;
     }
+    // FIXED: Ensure preferIndividualCharacterInGroup defaults to true for new and existing installations
     if (!extensionSettings.moduleSettings.hasOwnProperty('preferIndividualCharacterInGroup')) {
-        extensionSettings.moduleSettings.preferIndividualCharacterInGroup = false;
+        extensionSettings.moduleSettings.preferIndividualCharacterInGroup = true;
     }
     if (!extensionSettings.moduleSettings.hasOwnProperty('showNotifications')) {
         extensionSettings.moduleSettings.showNotifications = true;
