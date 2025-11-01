@@ -1,3 +1,5 @@
+*This fork tries to fix some group chat instability/priority behaviors
+
 # 📌 Character Locks (STCL Extension for SillyTavern)
 
 A SillyTavern extension that automatically remembers and applies your preferred connection profile and preset settings for different characters, chats, and group conversations. No more constantly tweaking settings - just set them once and let the extension handle the rest.
