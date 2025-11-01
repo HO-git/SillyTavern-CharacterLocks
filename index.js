@@ -918,6 +918,7 @@ class SettingsManager {
     }
 
     onContextChanged() {
+        clearPendingGroupMemberSettings();
         // Add to queue and process asynchronously to prevent race conditions
         const timestamp = Date.now();
 
@@ -1328,6 +1329,14 @@ let pendingGroupMemberTimer = null;
 
 // ===== UTILITY FUNCTIONS =====
 
+function clearPendingGroupMemberSettings() {
+    pendingGroupMemberSettings = null;
+    if (pendingGroupMemberTimer) {
+        clearTimeout(pendingGroupMemberTimer);
+        pendingGroupMemberTimer = null;
+    }
+}
+
 function registerEventHandler(eventType, handler, description = '', options = {}) {
     try {
         if (!eventType) {
@@ -1374,11 +1383,7 @@ function cleanupExtension() {
     processingCharacter = false;
     isApplyingSettings = false;
 
-    pendingGroupMemberSettings = null;
-    if (pendingGroupMemberTimer) {
-        clearTimeout(pendingGroupMemberTimer);
-        pendingGroupMemberTimer = null;
-    }
+    clearPendingGroupMemberSettings();
 
     // Clear cache
     if (settingsManager?.chatContext) {
@@ -2323,17 +2328,20 @@ async function schedulePendingGroupMemberSettings({ chId, charObj, individual })
         return;
     }
 
+    const context = settingsManager.chatContext?.getCurrent ? settingsManager.chatContext.getCurrent() : null;
+    const contextGroupId = context?.groupId ?? null;
+    const contextChatId = context?.chatId ?? null;
+
+    clearPendingGroupMemberSettings();
+
     pendingGroupMemberSettings = {
         chId,
         name: charObj.name,
         settings: individual,
         autoApplyMode: prefs.autoApplyOnContextChange,
+        contextGroupId,
+        contextChatId,
     };
-
-    if (pendingGroupMemberTimer) {
-        clearTimeout(pendingGroupMemberTimer);
-        pendingGroupMemberTimer = null;
-    }
 
     pendingGroupMemberTimer = setTimeout(async () => {
         pendingGroupMemberTimer = null;
@@ -2356,13 +2364,25 @@ async function handleBeforeGroupMemberGenerate(eventData = {}) {
 
 async function applyPendingGroupMemberSettings(trigger, eventData = {}) {
     const pending = pendingGroupMemberSettings;
-    pendingGroupMemberSettings = null;
+    clearPendingGroupMemberSettings();
 
     if (!pending) {
         return;
     }
 
     try {
+        const currentContext = settingsManager.chatContext?.getCurrent ? settingsManager.chatContext.getCurrent() : null;
+        const currentGroupId = currentContext?.groupId ?? null;
+        const currentChatId = currentContext?.chatId ?? null;
+
+        const pendingGroupId = pending.contextGroupId ?? null;
+        const pendingChatId = pending.contextChatId ?? null;
+
+        if (pendingGroupId !== currentGroupId || pendingChatId !== currentChatId) {
+            if (DEBUG_MODE) console.log('STCL: Context changed before applying group member settings, skipping');
+            return;
+        }
+
         const { autoApplyMode, name, settings } = pending;
 
         if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
