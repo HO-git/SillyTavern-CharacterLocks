@@ -1323,12 +1323,22 @@ let contextChangeQueue = [];
 let processingContext = false;
 let processingCharacter = false;
 let registeredEventHandlers = [];
+let pendingGroupMemberSettings = null;
+let pendingGroupMemberTimer = null;
 
 // ===== UTILITY FUNCTIONS =====
 
-function registerEventHandler(eventType, handler, description = '') {
+function registerEventHandler(eventType, handler, description = '', options = {}) {
     try {
-        eventSource.on(eventType, handler);
+        if (!eventType) {
+            return false;
+        }
+
+        if (options.prepend && typeof eventSource.prependListener === 'function') {
+            eventSource.prependListener(eventType, handler);
+        } else {
+            eventSource.on(eventType, handler);
+        }
         registeredEventHandlers.push({ eventType, handler, description });
         if (DEBUG_MODE) console.log(`STCL: Registered event handler for ${eventType}${description ? ': ' + description : ''}`);
         return true;
@@ -1363,6 +1373,12 @@ function cleanupExtension() {
     processingContext = false;
     processingCharacter = false;
     isApplyingSettings = false;
+
+    pendingGroupMemberSettings = null;
+    if (pendingGroupMemberTimer) {
+        clearTimeout(pendingGroupMemberTimer);
+        pendingGroupMemberTimer = null;
+    }
 
     // Clear cache
     if (settingsManager?.chatContext) {
@@ -2185,6 +2201,19 @@ function setupEventListeners() {
                 onContextChanged();
             }, 'group chat creation');
 
+            const beforeGroupEvents = [
+                event_types?.BEFORE_GROUP_WRAPPER,
+                event_types?.BEFORE_GROUP_MEMBER_GENERATE,
+                'before group wrapper',
+                'before_group_wrapper'
+            ].filter(Boolean);
+
+            const uniqueBeforeEvents = [...new Set(beforeGroupEvents)];
+
+            uniqueBeforeEvents.forEach(eventName => {
+                registerEventHandler(eventName, handleBeforeGroupMemberGenerate, 'before group member generate', { prepend: true });
+            });
+
             // FIXED: Completely rewritten GROUP_MEMBER_DRAFTED handler
             registerEventHandler(event_types.GROUP_MEMBER_DRAFTED, async (chId) => {
                 try {
@@ -2247,48 +2276,7 @@ function setupEventListeners() {
 
                     if (DEBUG_MODE) console.log(`STCL: Found individual character settings for ${charObj.name} in group chat`);
 
-                    // Temporarily set the individual settings for priority resolution
-                    settingsManager.currentSettings.individual = individual;
-
-                    // Use the priority resolver to determine if individual settings should be applied
-                    const resolved = await settingsManager.getSettingsToApply();
-                    
-                    // Clear the temporary individual setting
-                    settingsManager.currentSettings.individual = null;
-
-                    if (resolved.settings !== individual) {
-                        if (DEBUG_MODE) console.log(`STCL: Individual character settings for ${charObj.name} not prioritized, skipping`);
-                        processingCharacter = false;
-                        return;
-                    }
-
-                    // Check auto-apply mode
-                    const extensionSettings = storageAdapter.getExtensionSettings();
-                    const prefs = extensionSettings.moduleSettings;
-                    const autoApplyMode = prefs.autoApplyOnContextChange;
-
-                    if (autoApplyMode === AUTO_APPLY_MODES.NEVER) {
-                        if (DEBUG_MODE) console.log('STCL: Auto-apply disabled, skipping character settings application');
-                        processingCharacter = false;
-                        return;
-                    } else if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
-                        const message = `Apply saved individual character settings for "${charObj.name}" in this group chat?`;
-                        const result = await callGenericPopup(message, POPUP_TYPE.CONFIRM, '', { 
-                            okButton: 'Apply', 
-                            cancelButton: 'Skip' 
-                        });
-                        
-                        if (result !== POPUP_RESULT.AFFIRMATIVE) {
-                            if (DEBUG_MODE) console.log('STCL: User declined to apply character settings');
-                            processingCharacter = false;
-                            return;
-                        }
-                    }
-
-                    // Apply the individual character settings
-                    if (DEBUG_MODE) console.log(`STCL: Applying individual character settings for ${charObj.name} in group chat`);
-                    await settingsManager._applySettingsToUI(individual);
-
+                    await schedulePendingGroupMemberSettings({ chId, charObj, individual });
                 } catch (error) {
                     console.error('STCL: Error in GROUP_MEMBER_DRAFTED handler:', error);
                 } finally {
@@ -2307,6 +2295,94 @@ function setupEventListeners() {
     registerSillyTavernEvents();
 
     // Connection profiles handle API changes automatically
+}
+
+async function schedulePendingGroupMemberSettings({ chId, charObj, individual }) {
+    if (!individual) {
+        return;
+    }
+
+    const extensionSettings = storageAdapter.getExtensionSettings();
+    const prefs = extensionSettings.moduleSettings;
+
+    if (prefs.autoApplyOnContextChange === AUTO_APPLY_MODES.NEVER) {
+        if (DEBUG_MODE) console.log('STCL: Auto-apply disabled, skipping pending group member settings');
+        return;
+    }
+
+    // Temporarily set the individual settings for priority resolution
+    settingsManager.currentSettings.individual = individual;
+
+    const resolved = await settingsManager.getSettingsToApply();
+
+    // Clear the temporary individual setting
+    settingsManager.currentSettings.individual = null;
+
+    if (resolved.settings !== individual) {
+        if (DEBUG_MODE) console.log(`STCL: Individual character settings for ${charObj.name} not prioritized, skipping`);
+        return;
+    }
+
+    pendingGroupMemberSettings = {
+        chId,
+        name: charObj.name,
+        settings: individual,
+        autoApplyMode: prefs.autoApplyOnContextChange,
+    };
+
+    if (pendingGroupMemberTimer) {
+        clearTimeout(pendingGroupMemberTimer);
+        pendingGroupMemberTimer = null;
+    }
+
+    pendingGroupMemberTimer = setTimeout(async () => {
+        pendingGroupMemberTimer = null;
+        await applyPendingGroupMemberSettings('timeout');
+    }, 300);
+}
+
+async function handleBeforeGroupMemberGenerate(eventData = {}) {
+    if (!pendingGroupMemberSettings) {
+        return;
+    }
+
+    if (pendingGroupMemberTimer) {
+        clearTimeout(pendingGroupMemberTimer);
+        pendingGroupMemberTimer = null;
+    }
+
+    await applyPendingGroupMemberSettings('before-event', eventData);
+}
+
+async function applyPendingGroupMemberSettings(trigger, eventData = {}) {
+    const pending = pendingGroupMemberSettings;
+    pendingGroupMemberSettings = null;
+
+    if (!pending) {
+        return;
+    }
+
+    try {
+        const { autoApplyMode, name, settings } = pending;
+
+        if (autoApplyMode === AUTO_APPLY_MODES.ASK) {
+            const message = `Apply saved individual character settings for "${name}" in this group chat?`;
+            const result = await callGenericPopup(message, POPUP_TYPE.CONFIRM, '', {
+                okButton: 'Apply',
+                cancelButton: 'Skip'
+            });
+
+            if (result !== POPUP_RESULT.AFFIRMATIVE) {
+                if (DEBUG_MODE) console.log('STCL: User declined to apply character settings');
+                return;
+            }
+        }
+
+        if (DEBUG_MODE) console.log(`STCL: Applying individual character settings for ${name} (trigger: ${trigger})`, eventData);
+        await settingsManager._applySettingsToUI(settings);
+    } catch (error) {
+        console.error('STCL: Failed to apply pending group member settings:', error);
+    }
 }
 
 // ===== MIGRATION =====
